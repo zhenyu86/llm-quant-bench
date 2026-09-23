@@ -4,8 +4,9 @@ from pathlib import Path
 import pytest
 
 import qbench.cli as cli
+import qbench.engine as engine
 from qbench.client import accept_chunk, parse_nonstream, parse_sse_lines, Reply
-from qbench.config import Model, endpoint, load_config, request_body
+from qbench.config import Config, Model, endpoint, load_config, request_body
 from qbench.report import _paired_ci, perf_round, summarize
 from qbench.selection import collect_manifest, dataset_args, limit
 
@@ -168,3 +169,65 @@ def test_any_two_models_can_be_compared(tmp_path):
     assert row["comparison_type"] == "model_comparison"
     assert row["controlled_comparison"] is True
     assert row["delta_pp"] == 100.0
+
+
+def test_backend_streams_output_and_redacts_secret(tmp_path, monkeypatch, capsys):
+    class FakeInput:
+        def __init__(self):
+            self.value = ""
+        def write(self, value):
+            self.value += value
+        def close(self):
+            pass
+
+    class FakeOutput:
+        def __init__(self, value):
+            self.value = value
+            self.index = 0
+        def read(self, size):
+            if self.index >= len(self.value):
+                return ""
+            result = self.value[self.index:self.index + size]
+            self.index += len(result)
+            return result
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = FakeInput()
+            self.stdout = FakeOutput("downloading SECRET\r50%\rcomplete\n")
+            self.returncode = 0
+        def wait(self):
+            return self.returncode
+        def terminate(self):
+            self.returncode = 130
+
+    fake = FakeProcess()
+    popen_options = {}
+    def fake_popen(*args, **kwargs):
+        popen_options.update(kwargs)
+        return fake
+    monkeypatch.setattr(engine.subprocess, "Popen", fake_popen)
+    log = tmp_path / "evalscope.log"
+    engine._backend({"kind": "test"}, log, "SECRET")
+    visible = capsys.readouterr().out
+    saved = log.read_text(encoding="utf-8")
+    assert "downloading [REDACTED]" in visible
+    assert "50%" in visible and "complete" in visible
+    assert "SECRET" not in visible and "SECRET" not in saved
+    assert json.loads(fake.stdin.value) == {"kind": "test"}
+    assert popen_options["env"]["PYTHONIOENCODING"] == "utf-8:replace"
+
+
+def test_performance_progress_explains_scenes_and_request_totals(tmp_path, monkeypatch, capsys):
+    model = Model("model_a", "vllm", "http://localhost:8000/v1", "model")
+    config = Config({"model_a": model}, {}, {
+        "concurrency": [1, 2], "requests_per_round": 3, "rounds": 2,
+        "warmup_requests": 1, "output_budget": 8,
+    }, tmp_path / "models.yaml")
+    monkeypatch.setattr(engine, "_backend", lambda *args, **kwargs: None)
+    result = engine.perf(config, model, "smoke", tmp_path / "run")
+    visible = capsys.readouterr().out
+    assert len(result) == 4
+    assert "共 4 个场景" in visible
+    assert "12 个正式请求 + 4 个预热请求 = 16 个请求" in visible
+    assert "[性能测试 4/4]" in visible

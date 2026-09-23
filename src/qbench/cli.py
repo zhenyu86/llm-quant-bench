@@ -50,13 +50,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "summarize":
             from .report import summarize
+            print(f"[报告汇总] 正在读取 {args.input.resolve()}，参考模型={args.baseline}", flush=True)
             summarize(args.input, args.baseline, args.output, simulation_only=args.simulation_only)
             print(f"报告已写入 {args.output.resolve()}")
             return 0
         config = load_config(args.config)
+        print(f"[配置] 已读取 {config.path}", flush=True)
         if args.command == "doctor":
             failed = False
-            for alias in args.model:
+            for index, alias in enumerate(args.model, 1):
+                print(f"[接口检查 {index}/{len(args.model)}] 模型={alias}，正在检查普通和流式请求...", flush=True)
                 result = doctor(config.model(alias), {**config.performance, **config.quality})
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 failed |= not result["ok"]
@@ -71,7 +74,8 @@ def main(argv: list[str] | None = None) -> int:
         if getattr(args, "resume", None) and (args.command != "quality" or len(args.model) != 1):
             raise ValueError("--resume 仅可用于单个模型的 quality")
         incomplete = False
-        for alias in args.model:
+        for model_index, alias in enumerate(args.model, 1):
+            print(f"\n[模型 {model_index}/{len(args.model)}] 开始测试 {alias}", flush=True)
             model = config.model(alias)
             run = args.resume.resolve() if getattr(args, "resume", None) else new_run(alias, args.output)
             if getattr(args, "resume", None):
@@ -92,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
                 incomplete |= any(item.get("status") != "complete" for item in outcome)
             meta["finished_at"] = now()
             save_json(run / "run.json", meta)
+            print(f"[模型 {model_index}/{len(args.model)}] {alias} 测试结束，结果目录：{run}", flush=True)
         return 1 if incomplete else 0
     except (ValueError, RuntimeError, FileNotFoundError, KeyError) as exc:
         print(f"错误: {exc}", file=sys.stderr)

@@ -33,13 +33,54 @@ def save_json(path: Path, value: object) -> None:
 
 
 def _backend(spec: dict, log_path: Path, secret: str | None = None) -> None:
+    """Run EvalScope while forwarding its output to the terminal and the log file."""
     env = os.environ.copy()
-    # EvalScope's own cache is kept in the client environment, separate from servers.
-    process = subprocess.run([sys.executable, "-m", "qbench.backend"], input=json.dumps(spec),
-                             capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
-    log = process.stdout + "\n" + process.stderr
-    if secret:
-        log = log.replace(secret, "[REDACTED]")
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8:replace"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "qbench.backend"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=0,
+        env=env,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    process.stdin.write(json.dumps(spec))
+    process.stdin.close()
+
+    chunks: list[str] = []
+    pending: list[str] = []
+
+    def emit(value: str) -> None:
+        safe = value.replace(secret, "[REDACTED]") if secret else value
+        chunks.append(safe)
+        terminal_encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        visible = safe.encode(terminal_encoding, errors="replace").decode(terminal_encoding, errors="replace")
+        print(visible, end="", flush=True)
+
+    try:
+        while True:
+            char = process.stdout.read(1)
+            if not char:
+                break
+            pending.append(char)
+            if char in "\r\n":
+                emit("".join(pending))
+                pending.clear()
+        if pending:
+            emit("".join(pending))
+        returncode = process.wait()
+    except KeyboardInterrupt:
+        process.terminate()
+        process.wait()
+        print("\n[已停止] 用户中断了当前任务。", flush=True)
+        raise
+
+    log = "".join(chunks)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(log, encoding="utf-8")
     if secret:
@@ -51,9 +92,8 @@ def _backend(spec: dict, log_path: Path, secret: str | None = None) -> None:
                         path.write_text(content.replace(secret, "[REDACTED]"), encoding="utf-8")
                 except (UnicodeError, OSError):
                     continue
-    if process.returncode:
+    if returncode:
         raise RuntimeError(f"EvalScope 失败；查看 {log_path}\n{log[-1500:]}")
-
 
 def _quality_spec(config: Config, model: Model | None, dataset: str, profile: str,
                   work_dir: Path, *, cache: Path | None = None) -> dict:
@@ -92,6 +132,7 @@ def _quality_spec(config: Config, model: Model | None, dataset: str, profile: st
 
 
 def prepare(config: Config, profile: str, datasets: list[str], data_root: Path) -> Path:
+    print(f"\n[数据准备] profile={profile}，数据集={', '.join(datasets)}", flush=True)
     identity = {"profile": profile, "hub": config.quality.get("dataset_hub", "modelscope"),
                 "dataset_ids": config.quality.get("dataset_ids"), "evalscope": _evalscope_version(),
                 "datasets": {name: dataset_args(name, profile, config.quality.get("dataset_ids")) for name in DATASETS}}
@@ -104,15 +145,19 @@ def prepare(config: Config, profile: str, datasets: list[str], data_root: Path) 
         if manifest.get("identity") == identity:
             existing = manifest.get("datasets", {})
         if all(name in existing for name in datasets):
+            print(f"[数据准备] 已存在完整缓存，直接复用：{manifest_path}", flush=True)
             return manifest_path
     all_items = dict(existing)
-    for name in datasets:
+    for index, name in enumerate(datasets, 1):
         if name in all_items:
+            print(f"[数据准备 {index}/{len(datasets)}] {name}：已有缓存", flush=True)
             continue
+        print(f"[数据准备 {index}/{len(datasets)}] {name}：正在下载或读取数据并固定样本...", flush=True)
         folder = root / f"{name}_{uuid.uuid4().hex[:8]}"
         spec = _quality_spec(config, None, name, profile, folder)
         _backend(spec, folder / "prepare.log")
         all_items[name] = collect_manifest(folder, [name])[name]
+        print(f"[数据准备 {index}/{len(datasets)}] {name}：完成，共 {all_items[name]['count']} 个样本", flush=True)
     problems = verify_counts(all_items, profile, datasets)
     if problems:
         raise RuntimeError("抽样数量不一致: " + "; ".join(problems))
@@ -120,6 +165,7 @@ def prepare(config: Config, profile: str, datasets: list[str], data_root: Path) 
                 "protocol": {name: dataset_args(name, profile) for name in datasets}, "prepared_at": now(),
                 "evalscope_version": _evalscope_version(), "identity": identity}
     save_json(manifest_path, manifest)
+    print(f"[数据准备] 全部完成，样本清单：{manifest_path}", flush=True)
     return manifest_path
 
 
@@ -145,10 +191,16 @@ def quality(config: Config, model: Model, profile: str, datasets: list[str], run
     expected = json.loads(manifest_path.read_text(encoding="utf-8"))["datasets"]
     root = run / "quality"
     outcomes = {}
-    for name in datasets:
+    print(f"\n[效果测试] 模型={model.alias}，profile={profile}，共 {len(datasets)} 个数据集", flush=True)
+    for index, name in enumerate(datasets, 1):
         folder = root / name
         spec = _quality_spec(config, model, name, profile, folder, cache=folder if resume else None)
         save_json(folder / "effective_config.json", {k: v for k, v in spec.items() if k != "api_key_env"})
+        print(
+            f"[效果测试 {index}/{len(datasets)}] {name}：开始，"
+            f"预计 {expected[name]['count']} 题，并发={config.quality.get('concurrency', 1)}",
+            flush=True,
+        )
         try:
             _backend(spec, folder / "evalscope.log", model.api_key())
             observed = collect_manifest(folder, [name])[name]
@@ -163,8 +215,14 @@ def quality(config: Config, model: Model, profile: str, datasets: list[str], run
             outcomes[name] = {"status": "complete" if valid else "incomplete", "expected": expected[name]["count"],
                               "observed": observed["count"], "sample_hash": observed["sha256"],
                               "reason": None if valid else "样本不一致、请求失败或评分缺失"}
+            print(
+                f"[效果测试 {index}/{len(datasets)}] {name}：{outcomes[name]['status']}，"
+                f"有效结果={len(items)}/{expected[name]['count']}",
+                flush=True,
+            )
         except Exception as exc:
             outcomes[name] = {"status": "incomplete", "reason": str(exc), "expected": expected[name]["count"]}
+            print(f"[效果测试 {index}/{len(datasets)}] {name}：incomplete，{exc}", flush=True)
     save_json(root / "quality_status.json", outcomes)
     return outcomes
 
@@ -180,6 +238,20 @@ def perf(config: Config, model: Model, profile: str, run: Path, *, concurrency: 
     levels = concurrency or [int(x) for x in settings.get("concurrency", [1, 4, 8])]
     n = requests or int(settings.get("requests_per_round", 128))
     rounds = int(settings.get("rounds", 3))
+    warmup = int(settings.get("warmup_requests", max(4, max(levels))))
+    scenes = len(levels) * rounds
+    formal_total = scenes * n
+    warmup_total = scenes * warmup
+    print(
+        f"\n[性能测试] 模型={model.alias}，并发级别={levels}，每轮正式请求={n}，"
+        f"轮数={rounds}，每轮预热={warmup}",
+        flush=True,
+    )
+    print(
+        f"[性能测试] 共 {scenes} 个场景，预计发送 {formal_total} 个正式请求 + "
+        f"{warmup_total} 个预热请求 = {formal_total + warmup_total} 个请求",
+        flush=True,
+    )
     root = run / "performance"
     workload = root / "workload.txt"
     workload_hash = write_workload(workload, max(128, n))
@@ -187,14 +259,21 @@ def perf(config: Config, model: Model, profile: str, run: Path, *, concurrency: 
     standard = {"model", "messages", "stream", "max_tokens", "temperature", "top_p", "frequency_penalty", "stop"}
     extra = {k: v for k, v in extra.items() if k not in standard}
     result = []
+    scene_index = 0
     for level in levels:
         for round_index in range(1, rounds + 1):
+            scene_index += 1
+            print(
+                f"[性能测试 {scene_index}/{scenes}] 并发={level}，第 {round_index}/{rounds} 轮"
+                f"：开始，正式请求={n}，预热请求={warmup}",
+                flush=True,
+            )
             folder = root / f"c{level}_r{round_index}"
             spec = {"kind": "perf", "model": model.model, "url": model.chat_url, "api": "openai",
                     "api_key_env": model.api_key_env, "parallel": [level], "number": [n],
                     "dataset": "line_by_line", "dataset_path": str(workload), "max_tokens": int(settings.get("output_budget", 256)),
                     "temperature": settings.get("temperature", 0), "stream": True,
-                    "warmup_num": int(settings.get("warmup_requests", max(4, level))),
+                    "warmup_num": warmup,
                     "no_test_connection": True,
                     "total_timeout": int(settings.get("timeout_seconds", 120)),
                     "outputs_dir": str(folder), "no_timestamp": True,
@@ -226,4 +305,8 @@ def perf(config: Config, model: Model, profile: str, run: Path, *, concurrency: 
                      "status": status, "reason": reason, "folder": str(folder)}
             result.append(entry)
             save_json(root / "performance_status.json", result)
+            print(
+                f"[性能测试 {scene_index}/{scenes}] 并发={level}，第 {round_index}/{rounds} 轮：{status}",
+                flush=True,
+            )
     return result
