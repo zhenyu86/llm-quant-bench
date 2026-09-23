@@ -1,0 +1,65 @@
+# 这是主要参数文件。命令中的 --model 后面填写 models 下的名称，
+# 例如：qbench doctor --model sglang_baseline。
+models:
+  # 未量化模型，作为对比基线。
+  sglang_baseline:
+    provider: sglang                     # sglang / vllm / deepseek / openai_compatible
+    base_url: http://127.0.0.1:30000/v1  # OpenAI 兼容服务地址
+    model: YOUR_SERVED_MODEL              # 服务实际暴露的模型名，需替换
+    api_key_env: null                     # 密钥环境变量名；本地无鉴权可为 null
+    base_model: YOUR_BASE_MODEL           # 基础模型名；量化前后必须相同才视为同模型对比
+    variant: baseline                     # 本次模型版本说明
+    hardware: unknown                     # 建议填写，例如 NVIDIA_H20_x1
+    server_parameters: {}                 # 仅用于记录和对比，不会自动启动服务
+    # extra_body:                         # 可选：随每个请求发送的服务专有参数
+    #   ignore_eos: true
+
+  # 量化模型示例。进行量化对比时应与基线使用相同硬件和服务参数。
+  vllm_quantized:
+    provider: vllm
+    base_url: http://127.0.0.1:8000/v1
+    model: YOUR_SERVED_MODEL
+    api_key_env: null
+    base_model: YOUR_BASE_MODEL
+    variant: quantized
+    hardware: unknown
+    server_parameters: {}
+
+  # 官方或远程 API 示例。真正的密钥放进 DEEPSEEK_API_KEY 环境变量，不能写在本文件中。
+  deepseek_official:
+    provider: deepseek
+    base_url: https://api.deepseek.com
+    model: deepseek-flash
+    api_key_env: DEEPSEEK_API_KEY
+    base_model: deepseek-flash
+    variant: official
+    hardware: unknown
+    server_parameters: {}
+
+# 能力评测参数：决定测试题、答案生成方式和单次请求行为。
+quality:
+  dataset_hub: modelscope     # 数据集来源
+  dataset_dir: data/evalscope # EvalScope 下载缓存目录
+  output_budget: 1024         # 每道题允许生成的最大 token 数
+  temperature: 0              # 建议保持 0，使不同模型的结果更容易复现和比较
+  timeout_seconds: 120        # 每个请求的超时时间
+  concurrency: 1              # 能力评测并发数；过高可能触发显存不足或限流
+  thinking_mode: "off"        # default / on / off；必须加引号，避免 YAML 把 off 当成布尔值
+  retries: 0                  # 能力请求失败后的重试次数
+
+# 性能评测参数：决定负载强度、轮数和性能请求的生成上限。
+performance:
+  mode: api                   # api：固定文本请求；fixed_tokens：固定输入/输出 token
+  concurrency: [1, 4, 8]      # 依次测试的并发级别
+  requests_per_round: 128     # 每个并发级别、每轮的正式请求数量
+  rounds: 3                   # 每个并发级别重复几轮，用于观察结果波动
+  warmup_requests: 4          # 每轮正式计时前的预热请求数，不计入汇总指标
+  output_budget: 256          # api 模式下每个请求允许生成的最大 token 数
+  timeout_seconds: 120        # 每个请求的超时时间
+  temperature: 0
+  thinking_mode: "off"        # default / on / off；能力与性能可分别控制
+
+  # fixed_tokens 模式仅支持适配的本地 SGLang/vLLM 服务，并需要取消下面三行的注释：
+  # tokenizer_path: /path/to/tokenizer
+  # input_tokens: 1024
+  # output_tokens: 256

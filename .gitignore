@@ -1,0 +1,27 @@
+# Python environments
+.venv/
+.venv*/
+venv/
+.conda/
+
+# Python caches and packaging output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.*test*/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Downloaded datasets and generated benchmark artifacts
+data/
+outputs/
+reports/
