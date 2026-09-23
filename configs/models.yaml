@@ -47,10 +47,13 @@ quality:
 # 性能评测参数：决定请求压力和重复次数。
 performance:
   mode: api                   # api：固定文本；fixed_tokens：固定 token 长度
-  concurrency: [1, 4, 8]      # 依次测试的并发数
-  requests_per_round: 128     # 每个并发、每轮的正式请求数
-  rounds: 3                   # 每个并发重复几轮
-  warmup_requests: 4          # 每轮预热请求数，不计入指标
+  # concurrency 是“同一时刻最多在处理几个请求”，不是总请求数。
+  concurrency: [1, 4, 8]      # 分别测并发 1、4、8，三个场景依次运行
+  requests_per_round: 128     # 每个并发场景、每一轮累计发送 128 个正式请求
+  rounds: 3                   # 每个并发场景重复 3 轮，用来观察波动
+  warmup_requests: 4          # 每个并发场景每轮先发 4 个预热请求，不计入指标
+  # 单模型正式请求总数 = 并发场景数 × requests_per_round × rounds
+  # 当前示例：3 × 128 × 3 = 1152 个正式请求；另有 3 × 4 × 3 = 36 个预热请求
   output_budget: 256          # 每个请求最多生成多少 token
   timeout_seconds: 120
   temperature: 0

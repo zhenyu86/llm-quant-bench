@@ -29,7 +29,7 @@ conda activate llm-quant-bench
 
 ## 2. 用什么命令启动
 
-普通用户统一使用：
+项目的所有操作统一使用：
 
 ```bash
 python main.py <功能> <参数>
@@ -48,7 +48,6 @@ python main.py doctor --model model_a
 - `doctor`：选择“检查接口”功能；
 - `--model model_a`：使用配置文件中的 `model_a`。
 
-项目安装后也可以使用 `qbench doctor ...`，它与 `python main.py doctor ...` 功能相同。本文统一采用更容易理解的 `python main.py` 写法。
 
 查看所有功能：
 
@@ -135,15 +134,85 @@ python main.py doctor --config configs/models.local.yaml --model model_a
 
 ### `performance`：性能测试参数
 
-|参数|作用|
-|---|---|
-|`mode`|`api` 使用固定文本；`fixed_tokens` 使用固定 token 长度|
-|`concurrency`|依次测试的并发数，例如 `[1, 4, 8]`|
-|`requests_per_round`|每个并发、每轮发送多少个正式请求|
-|`rounds`|每个并发重复测试几轮|
-|`warmup_requests`|正式计时前的预热请求数|
-|`output_budget`|每个性能请求最多生成多少 token|
-|`timeout_seconds`|单个请求超时时间|
+性能测试中最容易混淆的是“并发数”和“总请求数”：
+
+- **并发数**：同一时刻最多有多少个请求正在等待模型返回；
+- **每轮请求数**：在一个并发场景的一轮中，累计要完成多少个正式请求；
+- **轮数**：同一个并发场景重复几次；
+- **预热请求**：每轮正式计时前先发送的请求，不进入最终指标。
+
+配置示例：
+
+```yaml
+performance:
+  concurrency: [1, 4, 8]
+  requests_per_round: 128
+  rounds: 3
+  warmup_requests: 4
+  output_budget: 256
+  timeout_seconds: 120
+```
+
+这组参数会按顺序执行：
+
+1. 并发 1：每轮累计发送 128 个正式请求，重复 3 轮；
+2. 并发 4：每轮累计发送 128 个正式请求，最多同时处理 4 个，重复 3 轮；
+3. 并发 8：每轮累计发送 128 个正式请求，最多同时处理 8 个，重复 3 轮。
+
+`concurrency: 4` 不表示总共只发 4 个请求。它表示程序会尽量保持最多 4 个请求同时进行，完成一个后再补充下一个，直到这一轮累计完成 `requests_per_round` 个正式请求。
+
+|参数|含义|如何选择|
+|---|---|---|
+|`concurrency`|要依次测试的并发级别。例如 `[1, 4, 8]` 会产生三个独立场景|从 1 开始，逐步增加，观察吞吐何时不再增长、延迟何时明显上升|
+|`requests_per_round`|每个并发场景、每一轮累计发送的正式请求数|快速检查可用 16；正式测试建议 128 或更多，并且应明显大于并发数|
+|`rounds`|每个并发场景重复几轮|通常使用 3；多轮可以发现偶然波动|
+|`warmup_requests`|每个场景每轮正式计时前发送的请求数|通常至少 4；用于预热连接、缓存和服务|
+|`output_budget`|每个请求允许生成的最大 token 数|模型之间必须保持一致；它是上限，不保证一定生成这么多|
+|`timeout_seconds`|单个请求允许等待的最长秒数|模型输出较长或并发较高时需要适当增加|
+|`mode`|`api` 使用固定文本；`fixed_tokens` 固定输入和输出 token 长度|`api` 更容易使用；`fixed_tokens` 更适合严格性能实验|
+|`temperature`|生成随机性|性能对比通常设为 0|
+|`thinking_mode`|是否启用思考模式|所有参与对比的模型应使用相同设置|
+
+### 怎样计算总请求数
+
+单个模型的正式请求总数：
+
+```text
+并发场景数量 × requests_per_round × rounds
+```
+
+单个模型的预热请求总数：
+
+```text
+并发场景数量 × warmup_requests × rounds
+```
+
+以上面默认参数为例：
+
+```text
+并发场景数量 = 3（并发 1、4、8）
+正式请求 = 3 × 128 × 3 = 1152
+预热请求 = 3 × 4 × 3 = 36
+实际请求合计 = 1152 + 36 = 1188
+```
+
+如果一次测试两个模型，两个模型都会执行完整负载，因此实际请求合计是：
+
+```text
+1188 × 2 = 2376
+```
+
+命令行可以临时覆盖两个最常改的参数：
+
+```bash
+python main.py perf --model model_a --concurrency 1 4 --requests 16
+```
+
+这条命令表示测试并发 1 和并发 4；每个并发场景、每轮累计发送 16 个正式请求。`rounds` 和 `warmup_requests` 仍读取配置文件。
+
+注意：`--profile smoke`、`quick`、`full` 主要控制效果测试的题量，不会自动减少性能请求数。性能请求量由本节参数控制。
+
+`quality.concurrency` 是效果评测同时发送多少道题，与 `performance.concurrency` 是两套独立参数。
 
 ## 5. 完整使用流程
 

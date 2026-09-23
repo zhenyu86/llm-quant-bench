@@ -12,9 +12,7 @@ from .selection import DATASETS
 
 
 def parser() -> argparse.ArgumentParser:
-    entry = Path(sys.argv[0]).name.lower()
-    program = "python main.py" if entry == "main.py" else "qbench"
-    root = argparse.ArgumentParser(prog=program, description="大模型效果与性能对比工具")
+    root = argparse.ArgumentParser(prog="python main.py", description="大模型效果与性能对比工具")
     sub = root.add_subparsers(dest="command", required=True)
     for name in ("doctor", "prepare", "quality", "perf", "run", "summarize"):
         command = sub.add_parser(name)
@@ -28,8 +26,10 @@ def parser() -> argparse.ArgumentParser:
         if name in {"prepare", "quality", "run"}:
             command.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
         if name in {"perf", "run"}:
-            command.add_argument("--concurrency", nargs="+", type=int)
-            command.add_argument("--requests", type=int)
+            command.add_argument("--concurrency", nargs="+", type=int, metavar="N",
+                                 help="要测试的并发级别；每个数表示最多同时进行多少个请求")
+            command.add_argument("--requests", type=int, metavar="N",
+                                 help="每个并发级别、每一轮发送的正式请求总数")
         if name in {"quality", "run"}:
             command.add_argument("--resume", type=Path)
         if name in {"quality", "perf", "run"}:
