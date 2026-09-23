@@ -203,7 +203,7 @@ def summarize(input_dir: Path, baseline: str, output: Path, *, simulation_only: 
         for name, result in q.items():
             quality_rows.append({"model": alias, "run_id": meta["run_id"], "profile": meta["profile"],
                                  "simulated": bool(meta.get("simulated")),
-                                 "dataset": name, "comparison_type": "baseline" if alias == baseline else None,
+                                 "dataset": name, "comparison_type": "reference" if alias == baseline else None,
                                  **{k: v for k, v in result.items() if k != "items"}})
         status_path = run / "performance" / "performance_status.json"
         if status_path.exists():
@@ -218,11 +218,11 @@ def summarize(input_dir: Path, baseline: str, output: Path, *, simulation_only: 
         row["paired_ci_low_pp"] = None
         row["paired_ci_high_pp"] = None
         row["comparison_reason"] = None
+        row["controlled_comparison"] = None
         if base and row["model"] != baseline:
             target_run, target_meta = latest[row["model"]]
             base_run, base_meta = base
-            row["comparison_type"] = "same_base_model" if target_meta["model"].get("base_model") and \
-                target_meta["model"].get("base_model") == base_meta["model"].get("base_model") else "different_model_or_service"
+            row["comparison_type"] = "model_comparison"
             target = summarize_quality(target_run, row["dataset"])
             source = summarize_quality(base_run, row["dataset"])
             reasons = []
@@ -237,7 +237,9 @@ def summarize(input_dir: Path, baseline: str, output: Path, *, simulation_only: 
                     reasons.append(f"{key} 不同")
             if reasons:
                 row["comparison_reason"] = "; ".join(reasons)
+                row["controlled_comparison"] = False
             else:
+                row["controlled_comparison"] = True
                 row["delta_pp"] = (target["accuracy"] - source["accuracy"]) * 100
                 ci = _paired_ci(source["items"], target["items"], target["aggregation"] == "subject_macro")
                 if ci:
@@ -250,52 +252,48 @@ def summarize(input_dir: Path, baseline: str, output: Path, *, simulation_only: 
         variation = statistics.stdev(tps) / statistics.mean(tps) if len(tps) > 1 and statistics.mean(tps) else None
         for row in group:
             row["round_cv"] = variation
-            row["comparison_type"] = "baseline" if row["model"] == baseline else \
-                ("same_base_model" if base and latest[row["model"]][1]["model"].get("base_model") and
-                 latest[row["model"]][1]["model"].get("base_model") == base[1]["model"].get("base_model")
-                 else "different_model_or_service")
+            row["comparison_type"] = "reference" if row["model"] == baseline else "model_comparison"
             row["comparison_reason"] = None
-            row["quantization_conclusion_allowed"] = False
+            row["controlled_comparison"] = None
             if base and row["model"] != baseline:
                 candidate = next((x for x in perf_rows if x["model"] == baseline and x["mode"] == row["mode"] and
                                   x["concurrency"] == row["concurrency"] and x["round"] == row["round"]), None)
                 reasons = []
                 if candidate is None:
-                    reasons.append("基线缺少同场景")
+                    reasons.append("参考模型缺少同场景")
                 else:
                     for key in ("workload_sha256", "output_budget", "thinking_mode", "requests"):
                         if row.get(key) != candidate.get(key):
                             reasons.append(f"{key} 不同")
                     if row["status"] != "complete" or candidate["status"] != "complete":
                         reasons.append("测试未完成")
-                if row["comparison_type"] == "same_base_model":
-                    model = latest[row["model"]][1]["model"]
-                    reference = base[1]["model"]
-                    if model.get("hardware") == "unknown" or reference.get("hardware") == "unknown":
-                        reasons.append("硬件 unknown")
-                    elif model.get("hardware") != reference.get("hardware"):
-                        reasons.append("硬件不同")
-                    if model.get("server_parameters") != reference.get("server_parameters"):
-                        reasons.append("服务参数不同")
-                    row["quantization_conclusion_allowed"] = not reasons
+                model = latest[row["model"]][1]["model"]
+                reference = base[1]["model"]
+                if model.get("hardware") == "unknown" or reference.get("hardware") == "unknown":
+                    reasons.append("硬件信息缺失")
+                elif model.get("hardware") != reference.get("hardware"):
+                    reasons.append("硬件不同")
+                if model.get("server_parameters") != reference.get("server_parameters"):
+                    reasons.append("服务参数不同")
+                row["controlled_comparison"] = not reasons
                 row["comparison_reason"] = "; ".join(reasons) if reasons else None
     q_fields = ["model", "run_id", "profile", "simulated", "dataset", "accuracy", "delta_pp", "paired_ci_low_pp", "paired_ci_high_pp",
-                "samples", "expected", "failed", "unscored", "aggregation", "status", "comparison_type", "comparison_reason", "sample_hash"]
+                "samples", "expected", "failed", "unscored", "aggregation", "status", "comparison_type", "controlled_comparison", "comparison_reason", "sample_hash"]
     p_fields = ["model", "run_id", "profile", "simulated", "mode", "concurrency", "round", "requests", "actual_requests", "success", "failed",
                 "success_rate", "window_s", "request_throughput", "output_token_throughput", "output_tokens_avg",
                 "ttft_mean", "ttft_p50", "ttft_p95", "first_answer_mean", "first_answer_p50", "first_answer_p95",
                 "tpot_mean", "tpot_p50", "tpot_p95", "latency_mean", "latency_p50", "latency_p95",
                 "round_cv", "thinking_mode", "output_budget", "status", "comparison_type", "comparison_reason",
-                "quantization_conclusion_allowed", "workload_sha256", "failure_reasons"]
+                "controlled_comparison", "workload_sha256", "failure_reasons"]
     _csv(output / "quality_summary.csv", quality_rows, q_fields)
     _csv(output / "performance_summary.csv", perf_rows, p_fields)
-    comparison = {"baseline": baseline, "simulation_only": simulation_only, "models": details, "quality": quality_rows, "performance": perf_rows,
+    comparison = {"reference_model": baseline, "simulation_only": simulation_only, "models": details, "quality": quality_rows, "performance": perf_rows,
                   "notes": ["所有准确率为 0-1；delta_pp 与配对区间单位为百分点。",
-                            "官方 API 性能含网络、排队、缓存和限流影响，不代表量化方法本身收益。",
+                            "任意两个模型或服务都可以对比；实验条件不同时，结果表示端到端体验差异，不能只归因于模型本身。",
                             "通用 API 模式按实际输出长度统计；token 指标缺失为 N/A。"]}
     (output / "comparison.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     report_scope = "模拟运行；结果仅用于验证流程，不代表真实模型性能或能力。" if simulation_only else "真实服务运行。"
-    lines = ["# 大模型能力与服务性能报告", "", f"基线：{baseline}。{report_scope}仅使用已保存结果。", "",
+    lines = ["# 大模型能力与服务性能报告", "", f"参考模型：{baseline}。{report_scope}仅使用已保存结果。", "",
              "## 能力", "", "|模型|数据集|准确率|差值(pp)|95%配对区间(pp)|样本|状态|", "|---|---|---:|---:|---|---:|---|"]
     for row in quality_rows:
         ci = f"{_fmt(row['paired_ci_low_pp'])} 至 {_fmt(row['paired_ci_high_pp'])}"
@@ -313,6 +311,6 @@ def summarize(input_dir: Path, baseline: str, output: Path, *, simulation_only: 
         head = "".join("<th>" + html.escape(x) + "</th>" for x in fields)
         body = "".join("<tr>" + cells([row.get(x) for x in fields]) + "</tr>" for row in rows)
         return "<div class='scroll'><table><thead><tr>" + head + "</tr></thead><tbody>" + body + "</tbody></table></div>"
-    page = "<!doctype html><html lang='zh'><meta charset='utf-8'><title>qbench 报告</title><style>body{font:15px system-ui;margin:2rem;color:#17212b}h1,h2{color:#123b55}.scroll{overflow:auto}table{border-collapse:collapse;margin-bottom:2rem}td,th{padding:.55rem;border:1px solid #ccd7df;white-space:nowrap}th{background:#e9f2f7}tr:nth-child(even){background:#f8fbfc}</style><h1>大模型能力与服务性能报告</h1><p>基线：" + html.escape(baseline) + "。" + html.escape(report_scope) + "仅使用已保存结果。</p><h2>能力</h2>" + table(q_fields, quality_rows) + "<h2>性能</h2>" + table(p_fields, perf_rows) + "<p>官方 API 性能包含网络、排队、缓存和限流影响；不能据此推断量化方法本身收益。</p></html>"
+    page = "<!doctype html><html lang='zh'><meta charset='utf-8'><title>qbench 报告</title><style>body{font:15px system-ui;margin:2rem;color:#17212b}h1,h2{color:#123b55}.scroll{overflow:auto}table{border-collapse:collapse;margin-bottom:2rem}td,th{padding:.55rem;border:1px solid #ccd7df;white-space:nowrap}th{background:#e9f2f7}tr:nth-child(even){background:#f8fbfc}</style><h1>大模型能力与服务性能报告</h1><p>参考模型：" + html.escape(baseline) + "。" + html.escape(report_scope) + "仅使用已保存结果。</p><h2>能力</h2>" + table(q_fields, quality_rows) + "<h2>性能</h2>" + table(p_fields, perf_rows) + "<p>任意两个模型或服务都可以对比；实验条件不同时，结果表示端到端体验差异，不能只归因于模型本身。</p></html>"
     (output / "report.html").write_text(page, encoding="utf-8")
     return comparison

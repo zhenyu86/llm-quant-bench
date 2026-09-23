@@ -12,12 +12,15 @@ from .selection import DATASETS
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="qbench", description="EvalScope LLM 服务评测")
+    entry = Path(sys.argv[0]).name.lower()
+    program = "python main.py" if entry == "main.py" else "qbench"
+    root = argparse.ArgumentParser(prog=program, description="大模型效果与性能对比工具")
     sub = root.add_subparsers(dest="command", required=True)
     for name in ("doctor", "prepare", "quality", "perf", "run", "summarize"):
         command = sub.add_parser(name)
         if name != "summarize":
-            command.add_argument("--config", default="configs/models.yaml")
+            default_config = "configs/models.local.yaml" if Path("configs/models.local.yaml").exists() else "configs/models.yaml"
+            command.add_argument("--config", default=default_config)
         if name in {"doctor", "quality", "perf", "run"}:
             command.add_argument("--model", action="append", required=True)
         if name in {"prepare", "quality", "perf", "run"}:
@@ -35,7 +38,8 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--data", type=Path, default=Path("data"))
         if name == "summarize":
             command.add_argument("--input", type=Path, default=Path("outputs"))
-            command.add_argument("--baseline", required=True)
+            command.add_argument("--reference", "--baseline", dest="baseline", required=True,
+                                 metavar="MODEL", help="作为对照的模型配置名称；--baseline 是兼容旧版本的写法")
             command.add_argument("--output", type=Path, default=Path("reports"))
             command.add_argument("--simulation-only", action="store_true", help="仅汇总标记 simulated 的模拟运行")
     return root

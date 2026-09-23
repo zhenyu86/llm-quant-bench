@@ -25,3 +25,6 @@ Thumbs.db
 data/
 outputs/
 reports/
+
+# Local machine-specific model endpoints
+configs/models.local.yaml

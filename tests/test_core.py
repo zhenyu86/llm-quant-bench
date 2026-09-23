@@ -110,6 +110,8 @@ def test_simulated_report_preserves_incomplete_and_unrun_status(tmp_path):
     assert all(row["simulated"] for row in rows.values())
     assert "模拟运行" in (output / "report.md").read_text(encoding="utf-8")
     assert "模拟运行" in (output / "report.html").read_text(encoding="utf-8")
+    assert result["reference_model"] == "mock"
+    assert "baseline" not in result
 
 
 def test_cli_returns_failure_for_incomplete_result(tmp_path, monkeypatch):
@@ -133,3 +135,36 @@ def test_cli_returns_failure_for_incomplete_result(tmp_path, monkeypatch):
     code = cli.main(["quality", "--config", str(config), "--model", "mock",
                      "--profile", "smoke", "--datasets", "gsm8k", "--output", str(tmp_path)])
     assert code == 0
+
+
+def test_any_two_models_can_be_compared(tmp_path):
+    outputs = tmp_path / "outputs"
+    prediction = {"index": 0, "messages": [{"role": "user", "content": "2+2=?"}],
+                  "model_output": {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}}
+    for alias, family, score in (("model_a", "family-a", 0.0), ("model_b", "family-b", 1.0)):
+        run = outputs / alias
+        pred_dir = run / "quality" / "gsm8k" / "predictions" / alias
+        review_dir = run / "quality" / "gsm8k" / "reviews" / alias
+        pred_dir.mkdir(parents=True)
+        review_dir.mkdir(parents=True)
+        (run / "run.json").write_text(json.dumps({
+            "run_id": alias, "created_at": "2026-01-01", "finished_at": "2026-01-01",
+            "model": {"alias": alias, "base_model": family, "hardware": "same-gpu",
+                      "server_parameters": {}},
+            "profile": "smoke", "quality_settings": {"output_budget": 32, "temperature": 0,
+                                                      "thinking_mode": "off"},
+            "simulated": False}), encoding="utf-8")
+        (run / "quality" / "quality_status.json").write_text(json.dumps({
+            "gsm8k": {"status": "complete", "expected": 1, "sample_hash": "same-samples"}}),
+            encoding="utf-8")
+        (pred_dir / "gsm8k_main.jsonl").write_text(json.dumps(prediction) + "\n", encoding="utf-8")
+        review = {"index": 0, "target": ["4"], "sample_score": {"score": {
+            "main_score_name": "accuracy", "value": {"accuracy": score},
+            "prediction": "4", "extracted_prediction": "4"}}}
+        (review_dir / "gsm8k_main.jsonl").write_text(json.dumps(review) + "\n", encoding="utf-8")
+
+    result = summarize(outputs, "model_a", tmp_path / "reports")
+    row = next(x for x in result["quality"] if x["model"] == "model_b" and x["dataset"] == "gsm8k")
+    assert row["comparison_type"] == "model_comparison"
+    assert row["controlled_comparison"] is True
+    assert row["delta_pp"] == 100.0

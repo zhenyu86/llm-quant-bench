@@ -103,7 +103,7 @@ performance:
             code = main([command[0], "--config", str(config), *command[1:]])
             if code:
                 return code
-        return main(["summarize", "--input", "outputs/mock", "--baseline", "mock",
+        return main(["summarize", "--input", "outputs/mock", "--reference", "mock",
                      "--output", "reports/mock", "--simulation-only"])
     finally:
         server.shutdown()
