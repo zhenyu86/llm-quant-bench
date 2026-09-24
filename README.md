@@ -331,9 +331,9 @@ python main.py summarize --input outputs --reference model_a --output reports
 - `效果测试 i/N`：当前数据集、预计题数和请求并发数；
 - `性能测试 i/N`：当前并发档位和轮次；开始前会汇总正式请求数、预热请求数和总请求数；
 - `模型 i/N`：一次测试多个模型时，表示当前正在测试哪个模型；
-- EvalScope 的下载、请求和统计输出：原样实时转发到终端，敏感鉴权信息会被隐藏。
+- `实时进度`：下载、准备题目、效果请求、预热请求或性能请求的完成比例。
 
-底层输出同时保存在相应结果目录的 `evalscope.log` 或 `prepare.log` 中，方便测试结束后排查问题。个别请求生成时间较长时，终端可能短暂停顿；场景开始提示可以确认程序已经进入该项测试。
+测试期间，终端只使用一行连续刷新实时进度，EvalScope 的普通 INFO、配置表和统计表不会穿插显示。完整底层输出仍保存在相应结果目录的 `evalscope.log` 或 `prepare.log` 中，错误排查不会丢失信息，敏感鉴权信息仍会被隐藏。
 
 ## 7. 性能指标是什么意思
 
@@ -375,11 +375,13 @@ outputs/<时间_模型名_随机ID>/
 
 |文件|用途|
 |---|---|
-|`report.html`|浏览器查看的离线报告|
-|`report.md`|文字报告|
-|`quality_summary.csv`|Excel 可打开的效果明细|
-|`performance_summary.csv`|Excel 可打开的性能明细|
-|`comparison.json`|完整结构化结果|
+|`report.html`|浏览器查看的简洁对比报告|
+|`report.md`|与 HTML 内容一致的文字简表|
+|`quality_summary.csv`|按数据集直接比较参考模型与对比模型|
+|`performance_summary.csv`|按并发汇总多轮结果，只保留四项核心性能指标|
+|`comparison.json`|完整结构化结果，包含全部内部字段和每轮明细|
+
+能力简表只显示参考准确率、对比准确率、百分点差值、置信区间、题数和状态。性能简表只显示输出速度、首 Token P95、总延迟 P95 和成功率；格式为“参考模型 → 对比模型（相对变化）”。
 
 状态含义：
 

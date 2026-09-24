@@ -142,7 +142,7 @@ def test_any_two_models_can_be_compared(tmp_path):
     outputs = tmp_path / "outputs"
     prediction = {"index": 0, "messages": [{"role": "user", "content": "2+2=?"}],
                   "model_output": {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}}
-    for alias, family, score in (("model_a", "family-a", 0.0), ("model_b", "family-b", 1.0)):
+    for alias, family, score, tokens in (("model_a", "family-a", 0.0, 5), ("model_b", "family-b", 1.0, 10)):
         run = outputs / alias
         pred_dir = run / "quality" / "gsm8k" / "predictions" / alias
         review_dir = run / "quality" / "gsm8k" / "reviews" / alias
@@ -154,6 +154,7 @@ def test_any_two_models_can_be_compared(tmp_path):
                       "server_parameters": {}},
             "profile": "smoke", "quality_settings": {"output_budget": 32, "temperature": 0,
                                                       "thinking_mode": "off"},
+            "performance_settings": {"warmup_requests": 0},
             "simulated": False}), encoding="utf-8")
         (run / "quality" / "quality_status.json").write_text(json.dumps({
             "gsm8k": {"status": "complete", "expected": 1, "sample_hash": "same-samples"}}),
@@ -163,12 +164,36 @@ def test_any_two_models_can_be_compared(tmp_path):
             "main_score_name": "accuracy", "value": {"accuracy": score},
             "prediction": "4", "extracted_prediction": "4"}}}
         (review_dir / "gsm8k_main.jsonl").write_text(json.dumps(review) + "\n", encoding="utf-8")
+        perf_dir = run / "performance" / "c1_r1"
+        perf_dir.mkdir(parents=True)
+        requests = [
+            {"id": index, "start": 0, "end": 1, "elapsed_s": 1, "http_status": 200,
+             "error": None, "first_content_s": 0.1, "first_answer_s": 0.2,
+             "usage": {"completion_tokens": tokens}}
+            for index in range(2)
+        ]
+        (perf_dir / "requests.jsonl").write_text(
+            "\n".join(json.dumps(item) for item in requests), encoding="utf-8"
+        )
+        (run / "performance" / "performance_status.json").write_text(json.dumps([{
+            "folder": str(perf_dir), "concurrency": 1, "round": 1, "requests": 2,
+            "mode": "api", "status": "complete", "workload_sha256": "same-workload",
+            "output_budget": 32, "thinking_mode": "off",
+        }]), encoding="utf-8")
 
     result = summarize(outputs, "model_a", tmp_path / "reports")
     row = next(x for x in result["quality"] if x["model"] == "model_b" and x["dataset"] == "gsm8k")
     assert row["comparison_type"] == "model_comparison"
     assert row["controlled_comparison"] is True
     assert row["delta_pp"] == 100.0
+    html_report = (tmp_path / "reports" / "report.html").read_text(encoding="utf-8")
+    csv_report = (tmp_path / "reports" / "quality_summary.csv").read_text(encoding="utf-8-sig")
+    assert "参考准确率(%)" in html_report and "对比准确率(%)" in html_report
+    assert "sample_hash" not in html_report
+    assert "参考准确率(%)" in csv_report
+    assert result["quality_comparison"][0]["参考模型"] == "model_a"
+    assert len(result["performance_comparison"]) == 1
+    assert result["performance_comparison"][0]["输出速度 token/s"] == "10.000 → 20.000 (+100.0%)"
 
 
 def test_backend_streams_output_and_redacts_secret(tmp_path, monkeypatch, capsys):
@@ -194,7 +219,7 @@ def test_backend_streams_output_and_redacts_secret(tmp_path, monkeypatch, capsys
     class FakeProcess:
         def __init__(self):
             self.stdin = FakeInput()
-            self.stdout = FakeOutput("downloading SECRET\r50%\rcomplete\n")
+            self.stdout = FakeOutput("2026 - INFO: noisy SECRET\nEvaluating[mmlu]:  40%|####      | 2/5 [00:01]\rEvaluating[mmlu]: 100%|##########| 5/5 [00:02]\n")
             self.returncode = 0
         def wait(self):
             return self.returncode
@@ -211,8 +236,10 @@ def test_backend_streams_output_and_redacts_secret(tmp_path, monkeypatch, capsys
     engine._backend({"kind": "test"}, log, "SECRET")
     visible = capsys.readouterr().out
     saved = log.read_text(encoding="utf-8")
-    assert "downloading [REDACTED]" in visible
-    assert "50%" in visible and "complete" in visible
+    assert "[实时进度] 效果请求 mmlu" in visible
+    assert "2/5" in visible and "5/5" in visible
+    assert "noisy" not in visible
+    assert "noisy [REDACTED]" in saved
     assert "SECRET" not in visible and "SECRET" not in saved
     assert json.loads(fake.stdin.value) == {"kind": "test"}
     assert popen_options["env"]["PYTHONIOENCODING"] == "utf-8:replace"

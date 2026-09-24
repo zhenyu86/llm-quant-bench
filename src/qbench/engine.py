@@ -33,7 +33,7 @@ def save_json(path: Path, value: object) -> None:
 
 
 def _backend(spec: dict, log_path: Path, secret: str | None = None) -> None:
-    """Run EvalScope while forwarding its output to the terminal and the log file."""
+    """Run EvalScope, keep its full log, and show one compact progress line."""
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8:replace"
@@ -54,13 +54,47 @@ def _backend(spec: dict, log_path: Path, secret: str | None = None) -> None:
 
     chunks: list[str] = []
     pending: list[str] = []
+    progress_width = 0
+    progress_visible = False
+    ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    progress_pattern = re.compile(
+        r"(?P<label>[^:\r\n]{1,80}):\s*(?P<percent>\d{1,3})%\|.*?\|\s*(?P<done>\d+)/(?P<total>\d+)"
+    )
 
     def emit(value: str) -> None:
+        nonlocal progress_width, progress_visible
         safe = value.replace(secret, "[REDACTED]") if secret else value
         chunks.append(safe)
+        clean = ansi.sub("", safe).strip()
+        for marker in (" - INFO: ", " - WARNING: ", " - ERROR: "):
+            if marker in clean:
+                clean = clean.rsplit(marker, 1)[-1]
+        match = progress_pattern.search(clean)
+        if not match:
+            return
+        label = match.group("label").strip()
+        if label.startswith("Running["):
+            return
+        if label == "Processing records":
+            label = "准备数据"
+        elif label == "Generating[requests]":
+            label = "生成请求"
+        elif label.startswith("Evaluating["):
+            label = "效果请求 " + label.removeprefix("Evaluating[").removesuffix("]")
+        elif label.startswith("Processing["):
+            label = "性能请求"
+        elif label.startswith("Warmup["):
+            label = "预热请求"
+        line = (
+            f"[实时进度] {label}：{int(match.group('percent')):3d}% "
+            f"({match.group('done')}/{match.group('total')})"
+        )
         terminal_encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-        visible = safe.encode(terminal_encoding, errors="replace").decode(terminal_encoding, errors="replace")
-        print(visible, end="", flush=True)
+        visible = line.encode(terminal_encoding, errors="replace").decode(terminal_encoding, errors="replace")
+        padding = " " * max(0, progress_width - len(visible))
+        print("\r" + visible + padding, end="", flush=True)
+        progress_width = len(visible)
+        progress_visible = True
 
     try:
         while True:
@@ -79,6 +113,9 @@ def _backend(spec: dict, log_path: Path, secret: str | None = None) -> None:
         process.wait()
         print("\n[已停止] 用户中断了当前任务。", flush=True)
         raise
+
+    if progress_visible:
+        print()
 
     log = "".join(chunks)
     log_path.parent.mkdir(parents=True, exist_ok=True)

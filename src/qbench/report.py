@@ -277,40 +277,190 @@ def summarize(input_dir: Path, baseline: str, output: Path, *, simulation_only: 
                     reasons.append("服务参数不同")
                 row["controlled_comparison"] = not reasons
                 row["comparison_reason"] = "; ".join(reasons) if reasons else None
-    q_fields = ["model", "run_id", "profile", "simulated", "dataset", "accuracy", "delta_pp", "paired_ci_low_pp", "paired_ci_high_pp",
-                "samples", "expected", "failed", "unscored", "aggregation", "status", "comparison_type", "controlled_comparison", "comparison_reason", "sample_hash"]
-    p_fields = ["model", "run_id", "profile", "simulated", "mode", "concurrency", "round", "requests", "actual_requests", "success", "failed",
-                "success_rate", "window_s", "request_throughput", "output_token_throughput", "output_tokens_avg",
-                "ttft_mean", "ttft_p50", "ttft_p95", "first_answer_mean", "first_answer_p50", "first_answer_p95",
-                "tpot_mean", "tpot_p50", "tpot_p95", "latency_mean", "latency_p50", "latency_p95",
-                "round_cv", "thinking_mode", "output_budget", "status", "comparison_type", "comparison_reason",
-                "controlled_comparison", "workload_sha256", "failure_reasons"]
-    _csv(output / "quality_summary.csv", quality_rows, q_fields)
-    _csv(output / "performance_summary.csv", perf_rows, p_fields)
-    comparison = {"reference_model": baseline, "simulation_only": simulation_only, "models": details, "quality": quality_rows, "performance": perf_rows,
-                  "notes": ["所有准确率为 0-1；delta_pp 与配对区间单位为百分点。",
-                            "任意两个模型或服务都可以对比；实验条件不同时，结果表示端到端体验差异，不能只归因于模型本身。",
-                            "通用 API 模式按实际输出长度统计；token 指标缺失为 N/A。"]}
-    (output / "comparison.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    targets = [alias for alias in latest if alias != baseline]
+    quality_by_key = {(row["model"], row["dataset"]): row for row in quality_rows}
+    quality_view = []
+    for target_alias in targets:
+        for dataset in DATASETS:
+            reference = quality_by_key.get((baseline, dataset))
+            target = quality_by_key.get((target_alias, dataset))
+            if not reference or not target:
+                continue
+            issues = []
+            if reference["status"] != "complete":
+                issues.append("参考模型" + reference["status"])
+            if target["status"] != "complete":
+                issues.append("对比模型" + target["status"])
+            if target.get("comparison_reason"):
+                for reason in target["comparison_reason"].split("; "):
+                    if reason != "测试未完成" and reason not in issues:
+                        issues.append(reason)
+            ci = None
+            if target.get("paired_ci_low_pp") is not None and target.get("paired_ci_high_pp") is not None:
+                ci = f"{_fmt(target['paired_ci_low_pp'])} 至 {_fmt(target['paired_ci_high_pp'])}"
+            quality_view.append({
+                "数据集": dataset,
+                "参考模型": baseline,
+                "参考准确率(%)": reference["accuracy"] * 100 if reference["accuracy"] is not None else None,
+                "对比模型": target_alias,
+                "对比准确率(%)": target["accuracy"] * 100 if target["accuracy"] is not None else None,
+                "差值(百分点)": target.get("delta_pp"),
+                "95%置信区间(百分点)": ci,
+                "题数(参考/对比)": f"{reference['samples']}/{target['samples']}",
+                "状态": "完整" if not issues else "无法完整比较",
+                "说明": "；".join(issues) if issues else "可直接比较",
+            })
+
+    def average_metric(rows: list[dict], key: str) -> float | None:
+        return _average([row.get(key) for row in rows])
+
+    perf_summary = {}
+    for (model_alias, mode, concurrency_level), rows in grouped.items():
+        reasons = []
+        for row in rows:
+            if row.get("comparison_reason"):
+                for reason in row["comparison_reason"].split("; "):
+                    if reason and reason not in reasons:
+                        reasons.append(reason)
+        perf_summary[(model_alias, mode, concurrency_level)] = {
+            "rounds": len(rows),
+            "output_token_throughput": average_metric(rows, "output_token_throughput"),
+            "ttft_p95": average_metric(rows, "ttft_p95"),
+            "latency_p95": average_metric(rows, "latency_p95"),
+            "success_rate": average_metric(rows, "success_rate"),
+            "complete": all(row["status"] == "complete" for row in rows),
+            "reasons": reasons,
+        }
+
+    def metric_pair(reference: float | None, target: float | None, *, scale: float = 1,
+                    unit: str = "", show_change: bool = True) -> str:
+        if reference is None or target is None:
+            return "N/A"
+        left, right = reference * scale, target * scale
+        change = (target - reference) / reference * 100 if reference else None
+        result = f"{_fmt(left)}{unit} → {_fmt(right)}{unit}"
+        if show_change and change is not None:
+            result += f" ({change:+.1f}%)"
+        return result
+
+    performance_view = []
+    for target_alias in targets:
+        target_keys = sorted(
+            ((mode, level) for model_alias, mode, level in perf_summary if model_alias == target_alias),
+            key=lambda item: (item[0], item[1]),
+        )
+        for mode, level in target_keys:
+            reference = perf_summary.get((baseline, mode, level))
+            target = perf_summary[(target_alias, mode, level)]
+            issues = list(target["reasons"])
+            if reference is None:
+                issues.insert(0, "参考模型缺少同并发场景")
+            else:
+                if not reference["complete"]:
+                    issues.insert(0, "参考模型测试未完成")
+                if not target["complete"]:
+                    issues.insert(0, "对比模型测试未完成")
+            performance_view.append({
+                "模式": mode,
+                "并发": level,
+                "轮数": target["rounds"],
+                "参考模型": baseline,
+                "对比模型": target_alias,
+                "输出速度 token/s": metric_pair(
+                    reference["output_token_throughput"] if reference else None,
+                    target["output_token_throughput"],
+                ),
+                "首Token时间P95(s)": metric_pair(
+                    reference["ttft_p95"] if reference else None,
+                    target["ttft_p95"],
+                ),
+                "总延迟P95(s)": metric_pair(
+                    reference["latency_p95"] if reference else None,
+                    target["latency_p95"],
+                ),
+                "成功率": metric_pair(
+                    reference["success_rate"] if reference else None,
+                    target["success_rate"],
+                    scale=100,
+                    unit="%",
+                    show_change=False,
+                ),
+                "说明": "；".join(dict.fromkeys(issues)) if issues else "可直接比较",
+            })
+
+    q_fields = ["数据集", "参考模型", "参考准确率(%)", "对比模型", "对比准确率(%)", "差值(百分点)",
+                "95%置信区间(百分点)", "题数(参考/对比)", "状态", "说明"]
+    p_fields = ["模式", "并发", "轮数", "参考模型", "对比模型", "输出速度 token/s",
+                "首Token时间P95(s)", "总延迟P95(s)", "成功率", "说明"]
+    _csv(output / "quality_summary.csv", quality_view, q_fields)
+    _csv(output / "performance_summary.csv", performance_view, p_fields)
+    comparison = {
+        "reference_model": baseline,
+        "simulation_only": simulation_only,
+        "models": details,
+        "quality": quality_rows,
+        "performance": perf_rows,
+        "quality_comparison": quality_view,
+        "performance_comparison": performance_view,
+        "notes": [
+            "能力表准确率使用百分比，差值与置信区间使用百分点。",
+            "性能表按同一并发下的多轮结果取平均；箭头左侧是参考模型，右侧是对比模型。",
+            "性能指标括号内是对比模型相对参考模型的变化；输出速度越高越好，时间越低越好。",
+            "完整内部字段仍保存在 comparison.json，简表只展示判断模型差异所需的主要指标。",
+        ],
+    }
+    (output / "comparison.json").write_text(
+        json.dumps(comparison, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
     report_scope = "模拟运行；结果仅用于验证流程，不代表真实模型性能或能力。" if simulation_only else "真实服务运行。"
-    lines = ["# 大模型能力与服务性能报告", "", f"参考模型：{baseline}。{report_scope}仅使用已保存结果。", "",
-             "## 能力", "", "|模型|数据集|准确率|差值(pp)|95%配对区间(pp)|样本|状态|", "|---|---|---:|---:|---|---:|---|"]
-    for row in quality_rows:
-        ci = f"{_fmt(row['paired_ci_low_pp'])} 至 {_fmt(row['paired_ci_high_pp'])}"
-        lines.append(f"|{row['model']}|{row['dataset']}|{_fmt(row['accuracy'])}|{_fmt(row['delta_pp'])}|{ci}|{row['samples']}|{row['status']}|")
-    lines += ["", "## 性能（每轮）", "", "|模型|模式|并发|轮次|输出 token/s|TTFT P95(s)|TPOT P95(s)|延迟 P95(s)|成功率|",
-              "|---|---|---:|---:|---:|---:|---:|---:|---:|"]
-    for row in perf_rows:
-        lines.append(f"|{row['model']}|{row['mode']}|{row['concurrency']}|{row['round']}|{_fmt(row['output_token_throughput'])}|{_fmt(row['ttft_p95'])}|{_fmt(row['tpot_p95'])}|{_fmt(row['latency_p95'])}|{_fmt(row['success_rate'])}|")
-    lines += ["", "## 解释", "", *["- " + note for note in comparison["notes"]], ""]
-    md = "\n".join(lines)
-    (output / "report.md").write_text(md, encoding="utf-8")
-    # Self-contained HTML, no remote CSS or scripts.
+
+    def markdown_table(fields: list[str], rows: list[dict]) -> list[str]:
+        result = ["|" + "|".join(fields) + "|", "|" + "|".join("---" for _ in fields) + "|"]
+        result.extend("|" + "|".join(_fmt(row.get(field)) for field in fields) + "|" for row in rows)
+        return result
+
+    lines = [
+        "# 大模型能力与服务性能报告",
+        "",
+        f"参考模型：{baseline}。{report_scope}仅使用已保存结果。",
+        "",
+        "## 能力对比",
+        "",
+        *markdown_table(q_fields, quality_view),
+        "",
+        "## 性能对比（同一并发的多轮平均）",
+        "",
+        *markdown_table(p_fields, performance_view),
+        "",
+        "## 怎么看",
+        "",
+        *["- " + note for note in comparison["notes"]],
+        "",
+    ]
+    (output / "report.md").write_text("\n".join(lines), encoding="utf-8")
+
     cells = lambda values: "".join("<td>" + html.escape(_fmt(x)) + "</td>" for x in values)
+
     def table(fields: list[str], rows: list[dict]) -> str:
         head = "".join("<th>" + html.escape(x) + "</th>" for x in fields)
         body = "".join("<tr>" + cells([row.get(x) for x in fields]) + "</tr>" for row in rows)
+        if not body:
+            body = f"<tr><td colspan='{len(fields)}'>没有可比较的数据</td></tr>"
         return "<div class='scroll'><table><thead><tr>" + head + "</tr></thead><tbody>" + body + "</tbody></table></div>"
-    page = "<!doctype html><html lang='zh'><meta charset='utf-8'><title>qbench 报告</title><style>body{font:15px system-ui;margin:2rem;color:#17212b}h1,h2{color:#123b55}.scroll{overflow:auto}table{border-collapse:collapse;margin-bottom:2rem}td,th{padding:.55rem;border:1px solid #ccd7df;white-space:nowrap}th{background:#e9f2f7}tr:nth-child(even){background:#f8fbfc}</style><h1>大模型能力与服务性能报告</h1><p>参考模型：" + html.escape(baseline) + "。" + html.escape(report_scope) + "仅使用已保存结果。</p><h2>能力</h2>" + table(q_fields, quality_rows) + "<h2>性能</h2>" + table(p_fields, perf_rows) + "<p>任意两个模型或服务都可以对比；实验条件不同时，结果表示端到端体验差异，不能只归因于模型本身。</p></html>"
+
+    notes_html = "".join("<li>" + html.escape(note) + "</li>" for note in comparison["notes"])
+    page = (
+        "<!doctype html><html lang='zh'><meta charset='utf-8'><title>模型对比报告</title>"
+        "<style>body{font:15px system-ui;margin:2rem;color:#17212b}h1,h2{color:#123b55}"
+        ".scroll{overflow:auto}table{border-collapse:collapse;margin-bottom:2rem;width:100%}"
+        "td,th{padding:.55rem;border:1px solid #ccd7df;white-space:nowrap;text-align:left}"
+        "th{background:#e9f2f7}tr:nth-child(even){background:#f8fbfc}</style>"
+        "<h1>大模型能力与服务性能报告</h1><p>参考模型：" + html.escape(baseline) + "。"
+        + html.escape(report_scope) + "仅使用已保存结果。</p><h2>能力对比</h2>"
+        + table(q_fields, quality_view)
+        + "<h2>性能对比（同一并发的多轮平均）</h2>"
+        + table(p_fields, performance_view)
+        + "<h2>怎么看</h2><ul>" + notes_html + "</ul></html>"
+    )
     (output / "report.html").write_text(page, encoding="utf-8")
     return comparison
